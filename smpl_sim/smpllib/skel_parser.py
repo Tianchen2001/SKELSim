@@ -49,15 +49,6 @@ def _normalize_gender(gender: str) -> str:
     raise ValueError(f"Unsupported SKEL gender: {gender!r}")
 
 
-def _relative_rotation(
-    global_orientations: np.ndarray,
-    body_index: int,
-    parent_index: int,
-) -> np.ndarray:
-    """Return the child orientation expressed relative to its parent."""
-    return global_orientations[parent_index].T @ global_orientations[body_index]
-
-
 def _complete_axis_matrix(active_axes: list[np.ndarray]) -> np.ndarray:
     """Pack up to three active axes into the columns of a 3x3 matrix.
 
@@ -233,59 +224,192 @@ class SKEL_Parser:
                 pose_dep_bs=True,
             )
 
+    def _compute_joint_frame_to_tpose(
+        self,
+        zero_output: Any,
+    ) -> np.ndarray:
+        """Return the static frame conjugation used by SKEL for each body.
+
+        SKEL constructs the local rotation of body ``i`` as
+
+            R_local = Rk01 @ Ra.T @ Rp(q) @ Ra @ Rk01.T
+
+        where ``Rp`` is produced by the biomechanical joint object.  Defining
+
+            C = Rk01 @ Ra.T
+
+        gives ``R_local = C @ Rp @ C.T``.  Thus ``C`` maps a joint axis from
+        the BSM/OpenSim parameter frame into the T-pose frame used by the
+        generated MuJoCo bodies.
+
+        We deliberately compute this from the same public SKEL routines as
+        ``SKEL.forward()`` instead of trying to recover it from
+        ``output.joints_ori``.  ``joints_ori`` contains global-chain and
+        bone-mesh alignment rotations and is not the local joint transform.
+        """
+        joints_tpose = zero_output.joints_tpose.detach().clone()
+
+        # This reproduces SKEL.forward() lines that form the parent-relative
+        # T-pose joint vectors before compute_bone_orientation().
+        joints_relative = joints_tpose.clone()
+        joints_relative[:, 1:, :] = (
+            joints_tpose[:, 1:, :]
+            - joints_tpose[:, self.model.parent, :]
+        )
+
+        with torch.no_grad():
+            rk01 = self.model.compute_bone_orientation(
+                joints_tpose,
+                joints_relative,
+            )
+
+        ra = self.model.apose_rel_transfo[:, :3, :3]
+        ra = ra.to(device=rk01.device, dtype=rk01.dtype)
+        ra = ra.unsqueeze(0).expand(rk01.shape[0], -1, -1, -1)
+
+        joint_frame_to_tpose = torch.matmul(
+            rk01,
+            ra.transpose(-1, -2),
+        )
+
+        return (
+            joint_frame_to_tpose[0]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+
+    def _joint_object_rotation(
+        self,
+        body_index: int,
+        local_dof_index: int,
+        angle: float,
+    ) -> np.ndarray:
+        """Evaluate one SKEL joint object's ``Rp(q)`` matrix.
+
+        Only the selected scalar coordinate is nonzero.  This preserves the
+        exact sign conventions used by CustomJoint, WalkerKnee, PinJoint,
+        ConstantCurvatureJoint, and EllipsoidJoint.
+        """
+        joint_object = self.model.joints_dict[body_index]
+
+        nb_dof = joint_object.nb_dof
+        if hasattr(nb_dof, "item"):
+            nb_dof = nb_dof.item()
+        nb_dof = int(nb_dof)
+
+        if not 0 <= local_dof_index < nb_dof:
+            raise IndexError(
+                f"Body {self.joint_names[body_index]!r} has {nb_dof} DOFs, "
+                f"but local DOF {local_dof_index} was requested."
+            )
+
+        device = self.model.skin_template_v.device
+        dtype = self.model.skin_template_v.dtype
+        q = torch.zeros((1, nb_dof), dtype=dtype, device=device)
+        q[0, local_dof_index] = float(angle)
+
+        with torch.no_grad():
+            rp = joint_object.q_to_rot(q)
+
+        return (
+            rp[0]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+
     def _infer_body_coordinates(
         self,
         betas: torch.Tensor,
         zero_output: Any,
+        joint_frame_to_tpose: np.ndarray,
         body_index: int,
     ) -> tuple[list[str], np.ndarray, np.ndarray, list[JointCoordinateMapping]]:
-        """Infer effective zero-pose axes for one SKEL body.
+        """Infer MuJoCo hinge axes from SKEL's actual local joint transform.
 
-        SKEL computes each local rotation as a chain wrapped by shape-dependent
-        T-pose and A-pose frames.  A small finite difference of the official
-        forward pass gives the effective axis in the parent frame without
-        duplicating that internal frame logic.
+        The generated MuJoCo bodies have no rest-pose ``quat``; at zero pose
+        their frames are aligned with the SKEL T-pose coordinates.  Therefore
+        the hinge axis written to MJCF must be expressed in that T-pose body
+        frame.
+
+        For each scalar coordinate we evaluate the corresponding SKEL joint
+        object at +epsilon and -epsilon, conjugate its ``Rp`` matrix by the
+        exact static SKEL frame ``C = Rk01 @ Ra.T``, and extract the signed
+        infinitesimal axis from the central relative rotation.
         """
         body_name = self.joint_names[body_index]
         parent_index = SKEL_PARENT_INDICES[body_index]
         pose_indices = list(SKEL_BODY_POSE_INDICES[body_name])
 
         if parent_index < 0:
-            return ["x", "y", "z"], np.eye(3), np.vstack(
-                [pose_limit(self.pose_names[index]) for index in pose_indices]
-            ), []
+            return (
+                ["x", "y", "z"],
+                np.eye(3, dtype=np.float64),
+                np.vstack(
+                    [
+                        pose_limit(self.pose_names[index])
+                        for index in pose_indices
+                    ]
+                ),
+                [],
+            )
 
-        zero_global_R = zero_output.joints_ori[0].detach().cpu().numpy()
-        zero_global_p = zero_output.joints[0].detach().cpu().numpy()
-        zero_local_R = _relative_rotation(
-            zero_global_R, body_index, parent_index
+        c_matrix = np.asarray(
+            joint_frame_to_tpose[body_index],
+            dtype=np.float64,
+        )
+        identity_error = np.linalg.norm(
+            c_matrix @ c_matrix.T - np.eye(3),
+            ord="fro",
+        )
+        if not np.isfinite(identity_error) or identity_error > 1e-4:
+            raise RuntimeError(
+                f"Invalid SKEL frame matrix for {body_name}: "
+                f"orthogonality error {identity_error:.3e}."
+            )
+
+        zero_global_p = (
+            zero_output.joints[0]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
         )
         zero_local_t = (
-            zero_global_R[parent_index].T
-            @ (zero_global_p[body_index] - zero_global_p[parent_index])
+            zero_global_p[body_index]
+            - zero_global_p[parent_index]
         )
 
         inferred: list[tuple[int, np.ndarray, np.ndarray]] = []
-        for pose_index in pose_indices:
-            perturbed_pose = torch.zeros((1, 46), dtype=torch.float32)
-            perturbed_pose[0, pose_index] = self.axis_epsilon
-            with torch.no_grad():
-                perturbed = self.model.forward(
-                    poses=perturbed_pose,
-                    betas=betas,
-                    trans=torch.zeros((1, 3), dtype=torch.float32),
-                    skelmesh=False,
-                    pose_dep_bs=True,
-                )
 
-            global_R = perturbed.joints_ori[0].detach().cpu().numpy()
-            global_p = perturbed.joints[0].detach().cpu().numpy()
-            local_R = _relative_rotation(global_R, body_index, parent_index)
+        for local_dof_index, pose_index in enumerate(pose_indices):
+            rp_plus = self._joint_object_rotation(
+                body_index,
+                local_dof_index,
+                +self.axis_epsilon,
+            )
+            rp_minus = self._joint_object_rotation(
+                body_index,
+                local_dof_index,
+                -self.axis_epsilon,
+            )
 
-            # SKEL left-multiplies the scalar rotations in q_to_rot().
-            delta_R = local_R @ zero_local_R.T
-            rotvec = Rotation.from_matrix(delta_R).as_rotvec()
-            axis = rotvec / self.axis_epsilon
+            # Exact local SKEL rotation in the generated body's T-pose frame:
+            # R_local(q) = C @ Rp(q) @ C.T
+            local_r_plus = c_matrix @ rp_plus @ c_matrix.T
+            local_r_minus = c_matrix @ rp_minus @ c_matrix.T
+
+            # Central finite difference on SO(3).  For a one-parameter
+            # rotation this is approximately Exp(2 * eps * axis).
+            central_delta_r = local_r_plus @ local_r_minus.T
+            rotvec = Rotation.from_matrix(
+                central_delta_r
+            ).as_rotvec()
+            axis = rotvec / (2.0 * self.axis_epsilon)
+
             norm = float(np.linalg.norm(axis))
             if not np.isfinite(norm) or norm < 1e-6:
                 raise RuntimeError(
@@ -294,30 +418,78 @@ class SKEL_Parser:
                 )
             axis = axis / norm
 
-            local_t = (
-                global_R[parent_index].T
-                @ (global_p[body_index] - global_p[parent_index])
+            # Translation coupling is separate from rotation.  It is nonzero
+            # mainly for scapula and constant-curvature spine joints.  With
+            # all ancestors at zero pose, the parent frame is aligned with
+            # the T-pose/world frame, so the parent-child position difference
+            # can be differentiated directly.
+            perturbed_pose = torch.zeros(
+                (1, 46),
+                dtype=betas.dtype,
+                device=betas.device,
+            )
+            perturbed_pose[0, pose_index] = self.axis_epsilon
+
+            with torch.no_grad():
+                perturbed = self.model.forward(
+                    poses=perturbed_pose,
+                    betas=betas,
+                    trans=torch.zeros(
+                        (1, 3),
+                        dtype=betas.dtype,
+                        device=betas.device,
+                    ),
+                    skelmesh=False,
+                    pose_dep_bs=True,
+                )
+
+            perturbed_global_p = (
+                perturbed.joints[0]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64)
+            )
+            perturbed_local_t = (
+                perturbed_global_p[body_index]
+                - perturbed_global_p[parent_index]
             )
             translation_derivative = (
-                local_t - zero_local_t
+                perturbed_local_t - zero_local_t
             ) / self.axis_epsilon
-            inferred.append((pose_index, axis, translation_derivative))
 
-        # MuJoCo applies multiple joints in XML order.  SKEL's CustomJoint
-        # returns R_n ... R_1, so the default XML order is reversed.
+            inferred.append(
+                (
+                    pose_index,
+                    axis,
+                    translation_derivative,
+                )
+            )
+
+        # SKEL's CustomJoint composes scalar rotations as R_n ... R_1.
+        # The existing SMPLSim writer serializes MuJoCo joints in channel
+        # order, so reverse the scalar order by default.  This does not affect
+        # one-DOF joints such as the knee.
         if self.reverse_multidof_order and len(inferred) > 1:
             inferred = list(reversed(inferred))
 
         channels = ["x", "y", "z"][: len(inferred)]
-        axes = _complete_axis_matrix([item[1] for item in inferred])
+        axes = _complete_axis_matrix(
+            [item[1] for item in inferred]
+        )
         ranges = np.vstack(
-            [pose_limit(self.pose_names[item[0]]) for item in inferred]
+            [
+                pose_limit(self.pose_names[item[0]])
+                for item in inferred
+            ]
         )
 
-        mappings = []
-        for channel, (pose_index, axis, translation_derivative) in zip(
-            channels, inferred
-        ):
+        mappings: list[JointCoordinateMapping] = []
+        for channel, (
+            pose_index,
+            axis,
+            translation_derivative,
+        ) in zip(channels, inferred):
             mappings.append(
                 JointCoordinateMapping(
                     body_name=body_name,
@@ -326,9 +498,12 @@ class SKEL_Parser:
                     channel=channel,
                     mjcf_joint_name=f"{body_name}_{channel}",
                     axis_parent_frame=axis.copy(),
-                    translation_derivative=translation_derivative.copy(),
+                    translation_derivative=(
+                        translation_derivative.copy()
+                    ),
                 )
             )
+
         return channels, axes, ranges, mappings
 
     def get_mesh_offsets(
@@ -375,6 +550,10 @@ class SKEL_Parser:
             foot_mask = vertices[:, 1] < minimum_y + 0.01
             vertices[foot_mask, 1] = float(np.mean(vertices[foot_mask, 1]))
 
+        joint_frame_to_tpose = self._compute_joint_frame_to_tpose(
+            zero_output
+        )
+
         joint_offsets: dict[str, np.ndarray] = {}
         joint_parents: dict[str, str | None] = {}
         joint_axes: dict[str, np.ndarray] = {}
@@ -395,7 +574,10 @@ class SKEL_Parser:
 
             channels, axes, ranges, body_mapping = (
                 self._infer_body_coordinates(
-                    betas_tensor, zero_output, body_index
+                    betas_tensor,
+                    zero_output,
+                    joint_frame_to_tpose,
+                    body_index,
                 )
             )
             joint_dofs[body_name] = channels
