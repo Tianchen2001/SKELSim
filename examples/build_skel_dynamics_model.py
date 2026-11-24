@@ -188,7 +188,7 @@ def main() -> None:
     etree.SubElement(root, "compiler", angle="radian", autolimits="true")
     etree.SubElement(root, "option", timestep="0.002")
     default = etree.SubElement(root, "default")
-    etree.SubElement(default, "joint", armature="0.01", damping="0")
+    etree.SubElement(default, "joint", armature="0", damping="0")
     etree.SubElement(default, "geom", contype="0", conaffinity="0", rgba="0.8 0.6 0.4 1", group="1")
     # contype 0 / conaffinity 1 collides with the floor (contype 1) but not with another such geom.
     own_type = "0" if args.no_self_collision else "1"
