@@ -123,7 +123,9 @@ def main() -> None:
         frame_indices = frame_indices[: args.max_frames]
 
     gender = _normalize_gender(
-        sample["sex"] if "sex" in sample.files else mapping["gender"]
+        sample["skel_gender"]
+        if "skel_gender" in sample.files
+        else mapping["gender"]
     )
     skel = SKEL(gender=gender, model_path=args.skel_model_path)
 

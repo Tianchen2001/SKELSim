@@ -59,7 +59,10 @@ class SKEL_Robot:
         axis_epsilon: float = 1e-4,
         reverse_multidof_order: bool = True,
         real_weight: bool = False,
+        anchor_from_translation: bool = True,
     ) -> None:
+        self.anchor_from_translation = bool(anchor_from_translation)
+        self.anchor_report: list[tuple[str, float, float]] = []
         self.output_dir = Path(output_dir).expanduser().resolve()
         self.asset_dir = self.output_dir / "skel_assets"
         self.geom_dir = self.asset_dir / "geom"
@@ -96,15 +99,23 @@ class SKEL_Robot:
         axis_epsilon: float = 1e-4,
         reverse_multidof_order: bool = True,
         real_weight: bool = False,
+        anchor_from_translation: bool = True,
     ) -> "SKEL_Robot":
         data = np.load(npz_path, allow_pickle=True)
         robot = cls(
             skel_model_path=skel_model_path,
             output_dir=output_dir,
-            gender=str(data["sex"]) if "sex" in data.files else "male",
+            # ``skel_gender`` is the SKEL model the poses were fitted with.
+            # ``sex`` is the recorded sex and can be "unknown".
+            gender=str(
+                data["skel_gender"]
+                if "skel_gender" in data.files
+                else data["sex"] if "sex" in data.files else "male"
+            ),
             axis_epsilon=axis_epsilon,
             reverse_multidof_order=reverse_multidof_order,
             real_weight=real_weight,
+            anchor_from_translation=anchor_from_translation,
         )
         robot.betas = np.asarray(data["betas"], dtype=np.float32).reshape(10)
         robot.mass_kg = (
@@ -194,10 +205,38 @@ class SKEL_Robot:
         self.skeleton.write_xml(str(xml_path))
 
         tree = etree.parse(str(xml_path))
+        coupling = self.parser.last_translation_coupling
+        self.anchor_report = []
         for joint_node in tree.xpath(
             "/mujoco/worldbody//joint[not(@type='free')]"
         ):
-            joint_node.attrib["pos"] = "0 0 0"
+            # SKEL moves the origin of some bodies as their own joint angles
+            # change (constant-curvature spine, scapula on the thorax
+            # ellipsoid).  A hinge whose anchor is shifted off the body origin
+            # produces exactly such a motion: with unit axis a and anchor c
+            # (body frame, origin o = 0), d(origin)/dq = a x (o - c).  Choosing
+            # c = a x d reproduces the SKEL derivative d = d(translation)/dq
+            # at the zero pose, for the part of d perpendicular to a.
+            anchor = np.zeros(3)
+            if self.anchor_from_translation:
+                axis = np.asarray(
+                    joint_node.attrib["axis"].split(), dtype=np.float64
+                )
+                axis = axis / np.linalg.norm(axis)
+                derivative = np.asarray(
+                    coupling.get(joint_node.attrib["name"], np.zeros(3)),
+                    dtype=np.float64,
+                )
+                if np.linalg.norm(derivative) > 1e-3:
+                    anchor = np.cross(axis, derivative)
+                    self.anchor_report.append(
+                        (
+                            joint_node.attrib["name"],
+                            float(np.linalg.norm(derivative)),
+                            float(abs(np.dot(axis, derivative))),
+                        )
+                    )
+            joint_node.attrib["pos"] = "{:.6f} {:.6f} {:.6f}".format(*anchor)
         tree.write(
             str(xml_path),
             pretty_print=True,
@@ -254,6 +293,23 @@ class SKEL_Robot:
                     ),
                 }
                 for item in self.parser.last_mapping
+            ],
+            "bodies": [
+                {
+                    "name": name,
+                    "parent": (
+                        SKEL_BODY_NAMES[SKEL_PARENT_INDICES[index]]
+                        if SKEL_PARENT_INDICES[index] >= 0
+                        else None
+                    ),
+                    "origin_model_frame": self.parser.last_body_origins[
+                        index
+                    ].tolist(),
+                    "opensim_frame_in_model_frame": self.parser.last_body_frames[
+                        index
+                    ].tolist(),
+                }
+                for index, name in enumerate(SKEL_BODY_NAMES)
             ],
             "known_kinematic_approximations": [
                 "Scapular ellipsoid translation is not represented by static hinges.",

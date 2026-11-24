@@ -144,3 +144,10 @@ demo_vis
 demo*
 *.pkl
 new_trials
+skelsim_check/
+skel_general_male/
+skel_general_female/
+MUJOCO_LOG.TXT
+*.patch
+*.orig
+*.rej

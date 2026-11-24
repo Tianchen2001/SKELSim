@@ -91,6 +91,7 @@ class SKEL_Parser:
         self.model = SKEL(gender=self.gender, model_path=model_path)
         self.axis_epsilon = float(axis_epsilon)
         self.reverse_multidof_order = bool(reverse_multidof_order)
+        self.translation_epsilon = 1e-2
 
         self.joint_names = [str(name) for name in self.model.bone_names]
 
@@ -167,6 +168,8 @@ class SKEL_Parser:
         self.last_translation_coupling: dict[str, np.ndarray] = {}
         self.last_zero_output: Any | None = None
         self.last_zero_root: np.ndarray | None = None
+        self.last_body_frames: np.ndarray | None = None
+        self.last_body_origins: np.ndarray | None = None
 
     @property
     def num_q_params(self) -> int:
@@ -423,40 +426,43 @@ class SKEL_Parser:
             # all ancestors at zero pose, the parent frame is aligned with
             # the T-pose/world frame, so the parent-child position difference
             # can be differentiated directly.
-            perturbed_pose = torch.zeros(
-                (1, 46),
-                dtype=betas.dtype,
-                device=betas.device,
-            )
-            perturbed_pose[0, pose_index] = self.axis_epsilon
-
-            with torch.no_grad():
-                perturbed = self.model.forward(
-                    poses=perturbed_pose,
-                    betas=betas,
-                    trans=torch.zeros(
-                        (1, 3),
-                        dtype=betas.dtype,
-                        device=betas.device,
-                    ),
-                    skelmesh=False,
-                    pose_dep_bs=True,
+            # Central difference with a step that float32 can resolve.  With
+            # the 1e-4 step used for the axes, the constant-curvature spine
+            # evaluates r * (1 - cos(angle)) with cos(angle) rounded to 1.0,
+            # so its translation derivative came out as exactly zero.
+            step = self.translation_epsilon
+            local_t = []
+            for sign in (+1.0, -1.0):
+                perturbed_pose = torch.zeros(
+                    (1, 46),
+                    dtype=betas.dtype,
+                    device=betas.device,
                 )
-
-            perturbed_global_p = (
-                perturbed.joints[0]
-                .detach()
-                .cpu()
-                .numpy()
-                .astype(np.float64)
-            )
-            perturbed_local_t = (
-                perturbed_global_p[body_index]
-                - perturbed_global_p[parent_index]
-            )
-            translation_derivative = (
-                perturbed_local_t - zero_local_t
-            ) / self.axis_epsilon
+                perturbed_pose[0, pose_index] = sign * step
+                with torch.no_grad():
+                    perturbed = self.model.forward(
+                        poses=perturbed_pose,
+                        betas=betas,
+                        trans=torch.zeros(
+                            (1, 3),
+                            dtype=betas.dtype,
+                            device=betas.device,
+                        ),
+                        skelmesh=False,
+                        pose_dep_bs=True,
+                    )
+                perturbed_global_p = (
+                    perturbed.joints[0]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64)
+                )
+                local_t.append(
+                    perturbed_global_p[body_index]
+                    - perturbed_global_p[parent_index]
+                )
+            translation_derivative = (local_t[0] - local_t[1]) / (2.0 * step)
 
             inferred.append(
                 (
@@ -553,6 +559,11 @@ class SKEL_Parser:
         joint_frame_to_tpose = self._compute_joint_frame_to_tpose(
             zero_output
         )
+        # Orientation of each BSM/OpenSim body frame in the zero-pose model
+        # frame, and the body origins.  Needed to place inertial parameters
+        # that are given in OpenSim body frames.
+        self.last_body_frames = joint_frame_to_tpose.copy()
+        self.last_body_origins = np.asarray(joints, dtype=np.float64).copy()
 
         joint_offsets: dict[str, np.ndarray] = {}
         joint_parents: dict[str, str | None] = {}
